@@ -9,6 +9,9 @@ extension AsrManager {
         let minimumRequiredSamples = ASRConstants.minimumRequiredSamples(forSampleRate: config.sampleRate)
         guard audioSamples.count >= minimumRequiredSamples else { throw ASRError.invalidAudioData }
 
+        // Reset any opt-in encoder-feature capture from a previous transcribe call.
+        if captureEncoderFeatures { capturedEncoderWindows = [] }
+
         let startTime = Date()
 
         // Route to appropriate processing method based on audio length
@@ -112,12 +115,28 @@ extension AsrManager {
             tokenConfidences: confidences
         )
 
+        // Populate opt-in acoustic features from the per-transcribe capture buffer.
+        let encoderFeatures: EncoderFeatureSequence?
+        if captureEncoderFeatures {
+            let windows = capturedEncoderWindows.map {
+                EncoderFeatureSequence.Window(frames: $0.frames, globalFrameOffset: $0.globalFrameOffset)
+            }
+            encoderFeatures = EncoderFeatureSequence(
+                windows: windows,
+                hiddenSize: modelVersion?.encoderHiddenSize ?? config.encoderHiddenSize,
+                secondsPerFrame: ASRConstants.secondsPerEncoderFrame
+            )
+        } else {
+            encoderFeatures = nil
+        }
+
         return ASRResult(
             text: text,
             confidence: confidence,
             duration: duration,
             processingTime: processingTime,
-            tokenTimings: resultTimings
+            tokenTimings: resultTimings,
+            encoderFeatures: encoderFeatures
         )
     }
 

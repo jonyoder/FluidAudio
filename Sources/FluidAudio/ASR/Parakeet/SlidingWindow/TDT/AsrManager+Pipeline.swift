@@ -59,6 +59,35 @@ extension AsrManager {
 
             let encoderSequenceLength = encoderLength[0].intValue
 
+            // Opt-in acoustic-feature capture (default off → zero work). Copy this
+            // window's valid encoder frames out before the array is consumed/discarded
+            // by the decoder, tagged with the window's global frame offset.
+            if captureEncoderFeatures {
+                // Opt-in runtime trace of the encoder array's physical layout. Gated
+                // by an env var so it stays silent in normal operation; useful for
+                // confirming the axis-detection layout (shape/strides) end-to-end.
+                if ProcessInfo.processInfo.environment["PARLEQ_ENCODER_SHAPE_TRACE"] == "1" {
+                    logger.info(
+                        "[encoder-shape] shape=\(rawEncoderOutput.shape) strides=\(rawEncoderOutput.strides) validFrames=\(encoderSequenceLength) globalFrameOffset=\(globalFrameOffset)"
+                    )
+                }
+                #if DEBUG
+                lastEncoderArrayShape = rawEncoderOutput.shape.map { $0.intValue }
+                lastEncoderArrayStrides = rawEncoderOutput.strides.map { $0.intValue }
+                #endif
+                // Use the loaded model's hidden size when available (e.g. 512 for
+                // tdtCtc110m); fall back to the config value otherwise. The default
+                // config value (1024) can differ from the model, and runtime axis
+                // detection matches on the true hidden dimension.
+                let hiddenSize = modelVersion?.encoderHiddenSize ?? config.encoderHiddenSize
+                let frames = try EncoderFeatureSequence.frames(
+                    from: rawEncoderOutput,
+                    validFrameCount: encoderSequenceLength,
+                    hiddenSize: hiddenSize
+                )
+                capturedEncoderWindows.append((frames: frames, globalFrameOffset: globalFrameOffset))
+            }
+
             // Calculate actual audio frames if not provided using shared constants
             let actualFrames =
                 actualAudioFrames ?? ASRConstants.calculateEncoderFrames(from: originalLength ?? paddedAudio.count)

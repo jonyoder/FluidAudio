@@ -96,12 +96,41 @@ public struct ASRResult: Codable, Sendable {
     public let ctcDetectedTerms: [String]?
     public let ctcAppliedTerms: [String]?
 
+    /// Opt-in acoustic encoder features for this transcription. Non-`nil` only when
+    /// `AsrManager.captureEncoderFeatures` was enabled for the call that produced this
+    /// result. Lets a consumer mean-pool a fixed-dimension embedding over a time span
+    /// (see `EncoderFeatureSequence.pooledEmbedding`). Excluded from `Codable` (the raw
+    /// encoder frames are large and not meant for serialization), so decoded results
+    /// always carry `nil` here.
+    public let encoderFeatures: EncoderFeatureSequence?
+
+    private enum CodingKeys: String, CodingKey {
+        case text, confidence, duration, processingTime, tokenTimings
+        case performanceMetrics, ctcDetectedTerms, ctcAppliedTerms
+        // `encoderFeatures` is intentionally omitted from coding.
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        text = try container.decode(String.self, forKey: .text)
+        confidence = try container.decode(Float.self, forKey: .confidence)
+        duration = try container.decode(TimeInterval.self, forKey: .duration)
+        processingTime = try container.decode(TimeInterval.self, forKey: .processingTime)
+        tokenTimings = try container.decodeIfPresent([TokenTiming].self, forKey: .tokenTimings)
+        performanceMetrics = try container.decodeIfPresent(
+            ASRPerformanceMetrics.self, forKey: .performanceMetrics)
+        ctcDetectedTerms = try container.decodeIfPresent([String].self, forKey: .ctcDetectedTerms)
+        ctcAppliedTerms = try container.decodeIfPresent([String].self, forKey: .ctcAppliedTerms)
+        encoderFeatures = nil
+    }
+
     public init(
         text: String, confidence: Float, duration: TimeInterval, processingTime: TimeInterval,
         tokenTimings: [TokenTiming]? = nil,
         performanceMetrics: ASRPerformanceMetrics? = nil,
         ctcDetectedTerms: [String]? = nil,
-        ctcAppliedTerms: [String]? = nil
+        ctcAppliedTerms: [String]? = nil,
+        encoderFeatures: EncoderFeatureSequence? = nil
     ) {
         self.text = text
         self.confidence = confidence
@@ -111,6 +140,7 @@ public struct ASRResult: Codable, Sendable {
         self.performanceMetrics = performanceMetrics
         self.ctcDetectedTerms = ctcDetectedTerms
         self.ctcAppliedTerms = ctcAppliedTerms
+        self.encoderFeatures = encoderFeatures
     }
 
     /// Real-time factor (RTFx) - how many times faster than real-time
@@ -134,7 +164,8 @@ public struct ASRResult: Codable, Sendable {
             tokenTimings: tokenTimings,
             performanceMetrics: performanceMetrics,
             ctcDetectedTerms: detected,
-            ctcAppliedTerms: applied
+            ctcAppliedTerms: applied,
+            encoderFeatures: encoderFeatures
         )
     }
 }

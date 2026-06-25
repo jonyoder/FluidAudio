@@ -565,6 +565,18 @@ struct ChunkProcessor {
             }
         }
 
+        // Merge any opt-in encoder-feature windows captured on worker clones back
+        // into the driver `manager`, which builds the final result. `workers[0]` is
+        // `manager` itself, so only drain the clones (indices 1...).
+        if await manager.captureEncoderFeatures, workers.count > 1 {
+            for worker in workers.dropFirst() {
+                let drained = await worker.drainCapturedEncoderWindows()
+                if !drained.isEmpty {
+                    await manager.appendCapturedEncoderWindows(drained)
+                }
+            }
+        }
+
         let orderedChunkOutputs = chunkOutputs.compactMap { $0 }
 
         guard var mergedTokens = orderedChunkOutputs.first else {

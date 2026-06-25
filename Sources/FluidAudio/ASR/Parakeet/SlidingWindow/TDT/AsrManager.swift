@@ -46,6 +46,33 @@ public actor AsrManager {
         config.dualDecodeArbitration
     }
 
+    /// Opt-in acoustic-feature export. When `true`, each sliding window's valid
+    /// encoder frames are copied out of the encoder `MLMultiArray` (frame-major
+    /// `[[Float]]`) and accumulated in `capturedEncoderWindows`; the final
+    /// `ASRResult.encoderFeatures` is then populated from that buffer. Default
+    /// `false` — when off, zero extra work is done on the hot path.
+    public var captureEncoderFeatures: Bool = false
+
+    /// Per-transcribe accumulation of captured encoder windows. Reset at the start
+    /// of each top-level transcribe call. Only written when `captureEncoderFeatures`
+    /// is `true`.
+    internal var capturedEncoderWindows: [(frames: [[Float]], globalFrameOffset: Int)] = []
+
+    /// Enable or disable opt-in encoder-feature capture.
+    public func setCaptureEncoderFeatures(_ enabled: Bool) {
+        captureEncoderFeatures = enabled
+    }
+
+    #if DEBUG
+    /// Test-only: the raw encoder `MLMultiArray`'s `.shape` (as `[Int]`) from the most
+    /// recent capture, for runtime layout verification. Only set when
+    /// `captureEncoderFeatures` is enabled.
+    internal var lastEncoderArrayShape: [Int]?
+    /// Test-only: the raw encoder `MLMultiArray`'s `.strides` (as `[Int]`) from the most
+    /// recent capture, for runtime layout verification.
+    internal var lastEncoderArrayStrides: [Int]?
+    #endif
+
     /// Cached vocabulary loaded once during initialization
     internal var vocabulary: [Int: String] = [:]
     #if DEBUG
@@ -60,8 +87,13 @@ public actor AsrManager {
         AsrModels.optimizedPredictionOptions()
     }()
 
-    public init(config: ASRConfig = .default, models: AsrModels? = nil) {
+    public init(
+        config: ASRConfig = .default,
+        models: AsrModels? = nil,
+        captureEncoderFeatures: Bool = false
+    ) {
         self.config = config
+        self.captureEncoderFeatures = captureEncoderFeatures
 
         if let models {
             self.asrModels = models
@@ -95,7 +127,27 @@ public actor AsrManager {
 
     internal func makeWorkerClone() -> AsrManager? {
         guard let models = asrModels else { return nil }
-        return AsrManager(config: config, models: models)
+        // Propagate opt-in encoder-feature capture so chunk workers also collect
+        // frames; the driver drains them back after the task group completes.
+        return AsrManager(
+            config: config, models: models, captureEncoderFeatures: captureEncoderFeatures)
+    }
+
+    /// Drain and return this manager's accumulated encoder-feature windows,
+    /// emptying the buffer. Used by the long-form chunk driver to gather frames
+    /// captured on worker clones.
+    internal func drainCapturedEncoderWindows() -> [(frames: [[Float]], globalFrameOffset: Int)] {
+        let drained = capturedEncoderWindows
+        capturedEncoderWindows = []
+        return drained
+    }
+
+    /// Append externally-captured encoder-feature windows into this manager's
+    /// buffer (used to merge worker-clone captures back into the driver).
+    internal func appendCapturedEncoderWindows(
+        _ windows: [(frames: [[Float]], globalFrameOffset: Int)]
+    ) {
+        capturedEncoderWindows.append(contentsOf: windows)
     }
 
     /// Returns the current transcription progress stream for offline long audio (>240,000 samples / ~15s).
@@ -411,6 +463,9 @@ public actor AsrManager {
         _ url: URL, decoderState: inout TdtDecoderState, language: Language? = nil
     ) async throws -> ASRResult {
         guard isAvailable else { throw ASRError.notInitialized }
+
+        // Reset any opt-in encoder-feature capture from a previous transcribe call.
+        if captureEncoderFeatures { capturedEncoderWindows = [] }
 
         let startTime = Date()
 

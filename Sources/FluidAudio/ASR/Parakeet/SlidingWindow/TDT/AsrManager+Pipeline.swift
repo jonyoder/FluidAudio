@@ -108,6 +108,11 @@ extension AsrManager {
         // first attempt did.
         let entryState = recoverable ? try TdtDecoderState(from: decoderState) : nil
 
+        // Opt-in encoder-feature capture appends inside runInference, which runs
+        // once per attempt. Keep only the frames of the attempt whose hypothesis is
+        // returned, so captured features always align with the returned timings.
+        let captureMark = capturedEncoderWindows.count
+
         var result = try await runInference(
             paddedAudio, originalLength: originalLength, actualAudioFrames: actualAudioFrames,
             lengthPolicy: [], decoderState: &decoderState,
@@ -116,8 +121,10 @@ extension AsrManager {
             emitTokensAfterGlobalFrame: emitTokensAfterGlobalFrame,
             initialTimeIndexOverride: initialTimeIndexOverride)
         guard Self.isWholeWindowBlank(result.hypothesis), let entryState else { return result }
+        let firstAttemptCapture = Array(capturedEncoderWindows[captureMark...])
 
         for policy in Self.emptyDecodeRecoveryPolicies {
+            capturedEncoderWindows.removeSubrange(captureMark...)
             var retryState = try TdtDecoderState(from: entryState)
             let retry = try await runInference(
                 paddedAudio, originalLength: originalLength, actualAudioFrames: actualAudioFrames,
@@ -133,6 +140,8 @@ extension AsrManager {
             decoderState = retryState
             return retry
         }
+        capturedEncoderWindows.removeSubrange(captureMark...)
+        capturedEncoderWindows.append(contentsOf: firstAttemptCapture)
         return result
     }
 
@@ -201,6 +210,36 @@ extension AsrManager {
                 from: encoderOutputProvider, key: "encoder_length",
                 errorMessage: "Invalid encoder output length")
             let encoderSequenceLength = encoderLength[0].intValue
+
+            // Opt-in acoustic-feature capture (default off → zero work). Copy this
+            // window's valid encoder frames out before the array is consumed/discarded
+            // by the decoder, tagged with the window's global frame offset.
+            if captureEncoderFeatures {
+                // Opt-in runtime trace of the encoder array's physical layout. Gated
+                // by an env var so it stays silent in normal operation; useful for
+                // confirming the axis-detection layout (shape/strides) end-to-end.
+                if ProcessInfo.processInfo.environment["PARLEQ_ENCODER_SHAPE_TRACE"] == "1" {
+                    logger.info(
+                        "[encoder-shape] shape=\(rawEncoderOutput.shape) strides=\(rawEncoderOutput.strides) validFrames=\(encoderSequenceLength) globalFrameOffset=\(globalFrameOffset)"
+                    )
+                }
+                #if DEBUG
+                lastEncoderArrayShape = rawEncoderOutput.shape.map { $0.intValue }
+                lastEncoderArrayStrides = rawEncoderOutput.strides.map { $0.intValue }
+                #endif
+                // Use the loaded model's hidden size when available (e.g. 512 for
+                // tdtCtc110m); fall back to the config value otherwise. The default
+                // config value (1024) can differ from the model, and runtime axis
+                // detection matches on the true hidden dimension.
+                let hiddenSize = modelVersion?.encoderHiddenSize ?? config.encoderHiddenSize
+                let frames = try EncoderFeatureSequence.frames(
+                    from: rawEncoderOutput,
+                    validFrameCount: encoderSequenceLength,
+                    hiddenSize: hiddenSize
+                )
+                capturedEncoderWindows.append((frames: frames, globalFrameOffset: globalFrameOffset))
+            }
+
             // Calculate actual audio frames if not provided using shared constants
             let actualFrames =
                 lengthPolicy.contains(.trimmedTail)

@@ -27,6 +27,12 @@ struct ChunkProcessor {
     // - 2.0s overlap (frame-aligned) to give the decoder slack when merging windows
     let overlapSeconds: Double = 2.0
 
+    /// Tail-chunk rescue trigger: the final window must leave at least this many
+    /// encoder frames (12 × 80ms ≈ 0.96s) untranscribed at its end before a
+    /// no-mel-context re-decode is attempted. Keeps the rescue off windows that
+    /// already reach the end of speech.
+    static let tailRescueMinGapFrames: Int = 12
+
     /// Context samples prepended from previous chunk for mel spectrogram stability (80ms = 1 encoder frame).
     /// The FastConformer encoder's depthwise convolutions need left context for stable output.
     /// Without this, the first frames of a chunk may produce features that cause all-blank predictions.
@@ -443,6 +449,9 @@ struct ChunkProcessor {
         var chunkDecision = chunkStarts.first ?? ChunkStartDecision(start: 0, useWarmupPrefix: false)
         var chunkStart = chunkDecision.start
         var chunkIndex = 0
+        // Tail-chunk rescue bookkeeping: remember the final window's sample span
+        // (see the rescue block after the decode loop for the why).
+        var lastChunkSpan: (index: Int, chunkStart: Int, chunkEnd: Int)?
 
         func collectNextResult(
             _ group: inout ThrowingTaskGroup<TaskResult, Error>
@@ -495,6 +504,9 @@ struct ChunkProcessor {
                 let index = chunkIndex
                 let chunkStartOffset = warmupSamples > 0 ? contextStart : chunkStart
                 chunkOutputs.append(nil)
+                if isLastChunk {
+                    lastChunkSpan = (index: index, chunkStart: chunkStart, chunkEnd: chunkEnd)
+                }
 
                 group.addTask {
                     var decoderState = TdtDecoderState.make(decoderLayers: decoderLayers)
@@ -562,6 +574,67 @@ struct ChunkProcessor {
             while inFlight > 0 {
                 try Task.checkCancellation()
                 try await collectNextResult(&group)
+            }
+        }
+
+        // ===== TAIL-CHUNK RESCUE =====
+        // The 80ms mel-context prepend (PR #264, melChunkContext=true) can push a
+        // short, low-amplitude FINAL window's encoder features below the joint's
+        // blank threshold, so the window decodes to blank across its tail and the
+        // trailing words are silently dropped — even though that same audio
+        // transcribes fine on the no-prepend single-window path. This shows up as
+        // the last window either emitting zero tokens or stopping well before the
+        // end of its own audio. When the un-transcribed tail of the last window
+        // still carries speech-level energy, re-decode the whole window once with
+        // NO mel-context and substitute; the rescued tokens flow through the
+        // normal overlap merge/dedup below (same machinery as any window seam).
+        // Skipped when encoder-feature capture is armed (voiceprint demo) so the
+        // extra pass never pollutes captured windows.
+        if melChunkContext, let span = lastChunkSpan, span.index < chunkOutputs.count,
+            !(await manager.captureEncoderFeatures)
+        {
+            let frameSamples = ASRConstants.samplesPerEncoderFrame
+            let windowStartFrame = span.chunkStart / frameSamples
+            let windowEndFrame = span.chunkEnd / frameSamples
+            let lastEmittedFrame = (chunkOutputs[span.index] ?? []).map { $0.timestamp }.max() ?? windowStartFrame
+            // Samples between the last emitted token and the window's audio end.
+            let trailingStart = min(max(span.chunkStart, lastEmittedFrame * frameSamples), span.chunkEnd)
+            let trailingCount = span.chunkEnd - trailingStart
+            // Fire only when a meaningful trailing span (>= ~1s) went untranscribed
+            // and still carries speech-level energy (skips genuine trailing silence).
+            if windowEndFrame - lastEmittedFrame >= Self.tailRescueMinGapFrames,
+                trailingCount >= frameSamples,
+                try windowHasSpeechEnergy(chunkStart: trailingStart, count: trailingCount)
+            {
+                let count = span.chunkEnd - span.chunkStart
+                let rescueSamples = try readSamples(offset: span.chunkStart, count: count)
+                var rescueState = TdtDecoderState.make(decoderLayers: decoderLayers)
+                rescueState.reset()
+                let (tokens, timestamps, confidences, durations) = try await Self.transcribeChunk(
+                    samples: rescueSamples,
+                    contextSamples: 0,
+                    chunkStart: span.chunkStart,
+                    isLastChunk: true,
+                    using: manager,
+                    decoderState: &rescueState,
+                    maxModelSamples: maxModelSamples,
+                    language: language
+                )
+                // Only substitute when the rescue reaches further than the original
+                // window (guards against a rescue that is no better).
+                let rescuedLastFrame = timestamps.max() ?? windowStartFrame
+                if !tokens.isEmpty, rescuedLastFrame > lastEmittedFrame {
+                    let durs =
+                        durations.count == tokens.count
+                        ? durations : Array(repeating: 0, count: tokens.count)
+                    let rescued: [TokenWindow] = zip(zip(zip(tokens, timestamps), confidences), durs).map {
+                        (token: $0.0.0.0, timestamp: $0.0.0.1, confidence: $0.0.1, duration: $0.1)
+                    }
+                    chunkOutputs[span.index] = rescued
+                    logger.info(
+                        "Tail-chunk rescue: re-decoded final window, "
+                            + "\(rescued.count) token(s), tail +\((rescuedLastFrame - lastEmittedFrame) * 8 / 100)s")
+                }
             }
         }
 
@@ -648,6 +721,26 @@ struct ChunkProcessor {
             try sampleSource.copySamples(into: pointer.baseAddress!, offset: offset, count: count)
         }
         return buffer
+    }
+
+    private func rms(offset: Int, count: Int) throws -> Float {
+        let samples = try readSamples(offset: offset, count: count)
+        guard !samples.isEmpty else { return 0 }
+        var acc = 0.0
+        for value in samples { acc += Double(value) * Double(value) }
+        return Float((acc / Double(samples.count)).squareRoot())
+    }
+
+    /// Whether a window carries speech-level energy relative to the whole
+    /// utterance. Used by the tail-chunk rescue to tell a genuinely silent
+    /// trailing window (user stopped talking — leave it empty) from one the
+    /// encoder wrongly blanked (real speech — worth re-decoding). Amplitude is
+    /// gain-relative so it holds for quiet recordings.
+    private func windowHasSpeechEnergy(chunkStart: Int, count: Int) throws -> Bool {
+        let windowRMS = try rms(offset: chunkStart, count: count)
+        let overallRMS = try rms(offset: 0, count: totalSamples)
+        guard overallRMS > 0 else { return false }
+        return windowRMS >= 0.25 * overallRMS
     }
 
     static func transcribeChunk(

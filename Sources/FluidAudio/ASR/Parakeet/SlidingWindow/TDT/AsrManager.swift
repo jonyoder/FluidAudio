@@ -57,6 +57,11 @@ public actor AsrManager {
         config.seamGapRepairMinGapSeconds
     }
 
+    /// Final-window end-alignment flag exposed to `ChunkProcessor` (issue #747).
+    internal var endAlignFinalWindow: Bool {
+        config.endAlignFinalWindow
+    }
+
     /// Opt-in acoustic-feature export. When `true`, each sliding window's valid
     /// encoder frames are copied out of the encoder `MLMultiArray` (frame-major
     /// `[[Float]]`) and accumulated in `capturedEncoderWindows`; the final

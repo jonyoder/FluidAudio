@@ -501,7 +501,7 @@ struct ChunkProcessor {
         var chunkDecision = chunkStarts.first ?? ChunkStartDecision(start: 0, useWarmupPrefix: false)
         var chunkStart = chunkDecision.start
         var chunkIndex = 0
-        let endAligned = Self.supportsSuppressedPrefix(modelVersion)
+        let endAligned = await manager.endAlignFinalWindow && Self.supportsSuppressedPrefix(modelVersion)
         // The final window must end at the last speech-bearing frame, not
         // EOF — see `speechEndSamples()`.
         let speechEnd = endAligned ? try speechEndSamples() : totalSamples

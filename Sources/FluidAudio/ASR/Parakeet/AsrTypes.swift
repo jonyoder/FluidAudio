@@ -53,6 +53,14 @@ public struct ASRConfig: Sendable {
     /// probe when `seamGapRepair` is enabled.
     public let seamGapRepairMinGapSeconds: Double
 
+    /// End-align the final long-form batch window at the last speech-bearing
+    /// frame, backfilling it with real audio decoded as a suppressed prefix
+    /// (issue #747, default `true`). Set `false` to restore the pre-#800
+    /// zero-padded final window. Applies to the default batch path on
+    /// decoders that support prefix suppression; the opt-in
+    /// `dualDecodeArbitration` path always end-aligns.
+    public let endAlignFinalWindow: Bool
+
     public static let `default` = ASRConfig()
 
     public init(
@@ -65,7 +73,8 @@ public struct ASRConfig: Sendable {
         melChunkContext: Bool? = nil,
         dualDecodeArbitration: Bool = false,
         seamGapRepair: Bool = true,
-        seamGapRepairMinGapSeconds: Double = 1.5
+        seamGapRepairMinGapSeconds: Double = 1.5,
+        endAlignFinalWindow: Bool = true
     ) {
         self.sampleRate = sampleRate
         self.tdtConfig = tdtConfig
@@ -77,6 +86,7 @@ public struct ASRConfig: Sendable {
         self.dualDecodeArbitration = dualDecodeArbitration
         self.seamGapRepair = seamGapRepair
         self.seamGapRepairMinGapSeconds = max(0.5, seamGapRepairMinGapSeconds)
+        self.endAlignFinalWindow = endAlignFinalWindow
     }
 
     /// Resolve the mel-context tri-state against the loaded model version.
